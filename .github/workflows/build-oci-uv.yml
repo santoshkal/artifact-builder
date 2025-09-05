@@ -1,0 +1,348 @@
+name: Build and Push MCP Server as OCI Artifact
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: 'Container registry URL'
+        required: true
+        default: 'ghcr.io'
+
+env:
+  REGISTRY: ${{ github.event.inputs.registry || 'ghcr.io' }}
+  REPOSITORY: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          version: "latest"
+
+      - name: Build wheel with uv
+        id: build
+        run: |
+          # Build the wheel
+          uv build --wheel --out-dir dist/
+          
+          # Get wheel filename
+          WHEEL_FILE=$(ls dist/*.whl | head -1)
+          WHEEL_NAME=$(basename "$WHEEL_FILE")
+          echo "wheel_file=$WHEEL_FILE" >> $GITHUB_OUTPUT
+          echo "wheel_name=$WHEEL_NAME" >> $GITHUB_OUTPUT
+          
+          # Get package name and version from wheel
+          PACKAGE_NAME=$(echo "$WHEEL_NAME" | cut -d'-' -f1)
+          PACKAGE_VERSION=$(echo "$WHEEL_NAME" | cut -d'-' -f2)
+          echo "package_name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+          echo "package_version=$PACKAGE_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create portable runner script
+        run: |
+          cat > dist/run-mcp-server.sh << 'EOF'
+          #!/usr/bin/env bash
+          # Portable runner for MCP server
+          set -e
+          
+          SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+          
+          # Function to install uv if needed
+          install_uv() {
+              echo "Installing uv..."
+              curl -LsSf https://astral.sh/uv/install.sh | sh
+              export PATH="$HOME/.local/bin:$PATH"
+          }
+          
+          # Check if uv is available
+          if ! command -v uv &> /dev/null; then
+              install_uv
+          fi
+          
+          # Find the wheel file
+          WHEEL_FILE=$(ls "$SCRIPT_DIR"/*.whl 2>/dev/null | head -1)
+          
+          if [ -z "$WHEEL_FILE" ]; then
+              echo "Error: No wheel file found in $SCRIPT_DIR"
+              exit 1
+          fi
+          
+          # Extract package name from wheel filename
+          WHEEL_NAME=$(basename "$WHEEL_FILE")
+          PACKAGE_NAME=$(echo "$WHEEL_NAME" | cut -d'-' -f1 | tr '_' '-')
+          
+          echo "Running MCP server from $WHEEL_NAME..."
+          
+          # Run the MCP server using uv
+          exec uv run --from "$WHEEL_FILE" --with "$WHEEL_FILE" "$PACKAGE_NAME" "$@"
+          EOF
+          
+          chmod +x dist/run-mcp-server.sh
+
+      - name: Create installer script
+        run: |
+          PACKAGE_NAME="${{ steps.build.outputs.package_name }}"
+          
+          cat > dist/install-mcp-server.sh << EOF
+          #!/usr/bin/env bash
+          # Installer for MCP server
+          set -e
+          
+          SCRIPT_DIR="\$( cd "\$( dirname "\${BASH_SOURCE[0]}" )" && pwd )"
+          
+          # Install uv if needed
+          if ! command -v uv &> /dev/null; then
+              echo "Installing uv..."
+              curl -LsSf https://astral.sh/uv/install.sh | sh
+              export PATH="\$HOME/.local/bin:\$PATH"
+          fi
+          
+          # Find and install the wheel
+          WHEEL_FILE=\$(ls "\$SCRIPT_DIR"/*.whl 2>/dev/null | head -1)
+          
+          if [ -z "\$WHEEL_FILE" ]; then
+              echo "Error: No wheel file found"
+              exit 1
+          fi
+          
+          echo "Installing MCP server..."
+          uv tool install --from "\$WHEEL_FILE" $PACKAGE_NAME
+          
+          echo "✅ Installation complete!"
+          echo "Run with: $PACKAGE_NAME"
+          EOF
+          
+          chmod +x dist/install-mcp-server.sh
+
+      - name: Create Python wrapper script
+        run: |
+          cat > dist/mcp-server.py << 'EOF'
+          #!/usr/bin/env python3
+          """
+          Standalone Python runner for MCP server.
+          This script can run the MCP server if the wheel is in the same directory.
+          """
+          import os
+          import sys
+          import subprocess
+          import tempfile
+          import zipfile
+          from pathlib import Path
+          
+          def find_wheel():
+              """Find the wheel file in the same directory as this script."""
+              script_dir = Path(__file__).parent
+              wheels = list(script_dir.glob("*.whl"))
+              if not wheels:
+                  print("Error: No wheel file found", file=sys.stderr)
+                  sys.exit(1)
+              return wheels[0]
+          
+          def extract_and_run(wheel_path):
+              """Extract wheel and run the MCP server."""
+              with tempfile.TemporaryDirectory() as tmpdir:
+                  # Extract wheel
+                  with zipfile.ZipFile(wheel_path, 'r') as z:
+                      z.extractall(tmpdir)
+                  
+                  # Add to path
+                  sys.path.insert(0, tmpdir)
+                  
+                  # Try to import and run
+                  try:
+                      # Try common entry points
+                      from mise_tasks_mcp.server import main
+                      main()
+                  except ImportError:
+                      try:
+                          from mcp_server import main
+                          main()
+                      except ImportError:
+                          print("Error: Could not find MCP server entry point", file=sys.stderr)
+                          sys.exit(1)
+          
+          if __name__ == "__main__":
+              wheel = find_wheel()
+              print(f"Running MCP server from {wheel.name}...")
+              extract_and_run(wheel)
+          EOF
+          
+          chmod +x dist/mcp-server.py
+
+      - name: Create metadata file
+        run: |
+          cat > dist/metadata.json << EOF
+          {
+            "name": "${{ steps.build.outputs.package_name }}",
+            "version": "${{ steps.build.outputs.package_version }}",
+            "wheel": "${{ steps.build.outputs.wheel_name }}",
+            "python_version": "3.12",
+            "build_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "git_sha": "${{ github.sha }}",
+            "git_ref": "${{ github.ref }}",
+            "runner_scripts": [
+              "run-mcp-server.sh",
+              "install-mcp-server.sh",
+              "mcp-server.py"
+            ]
+          }
+          EOF
+
+      - name: Create tarball bundle
+        run: |
+          cd dist
+          tar czf mcp-server-bundle.tar.gz *.whl *.sh *.py metadata.json
+          cd ..
+          echo "Bundle created: dist/mcp-server-bundle.tar.gz"
+          ls -lah dist/
+
+      - name: Install ORAS CLI
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          VERSION="1.2.0"
+          curl -LO "https://github.com/oras-project/oras/releases/download/v${VERSION}/oras_${VERSION}_linux_amd64.tar.gz"
+          mkdir -p oras-install/
+          tar -zxf oras_${VERSION}_*.tar.gz -C oras-install/
+          sudo mv oras-install/oras /usr/local/bin/
+          rm -rf oras_${VERSION}_*.tar.gz oras-install/
+          oras version
+
+      - name: Log in to Container Registry
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare OCI tags and labels
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        id: meta
+        run: |
+          # Generate version tag
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          elif [[ $GITHUB_REF == refs/heads/* ]]; then
+            VERSION="git-$(echo ${GITHUB_REF#refs/heads/} | sed -r 's#/+#-#g')-${GITHUB_SHA::8}"
+          else
+            VERSION="sha-${GITHUB_SHA::8}"
+          fi
+          
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          
+          # Full image reference
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.REPOSITORY }}"
+          echo "image_ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
+
+      - name: Push as OCI Artifact using ORAS
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          # Push the bundle as OCI artifact
+          echo "Pushing bundle to ${{ steps.meta.outputs.image_ref }}:${{ steps.meta.outputs.version }}"
+          
+          # Push complete bundle
+          oras push \
+            "${{ steps.meta.outputs.image_ref }}:${{ steps.meta.outputs.version }}" \
+            --artifact-type "application/vnd.mcp.server.v1+tar" \
+            --annotation "org.opencontainers.image.title=${{ steps.build.outputs.package_name }}" \
+            --annotation "org.opencontainers.image.version=${{ steps.build.outputs.package_version }}" \
+            --annotation "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.revision=${{ github.sha }}" \
+            --annotation "org.opencontainers.image.vendor=Capten.ai" \
+            --annotation "org.opencontainers.image.description=MCP server for mise tasks and configuration" \
+            dist/mcp-server-bundle.tar.gz:application/tar+gzip \
+            dist/metadata.json:application/json
+          
+          # Also push individual wheel for direct use
+          oras push \
+            "${{ steps.meta.outputs.image_ref }}:wheel-${{ steps.meta.outputs.version }}" \
+            --artifact-type "application/vnd.python.wheel.v1" \
+            dist/*.whl:application/zip
+          
+          # Push latest tag for main branch
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            oras push \
+              "${{ steps.meta.outputs.image_ref }}:latest" \
+              --artifact-type "application/vnd.mcp.server.v1+tar" \
+              dist/mcp-server-bundle.tar.gz:application/tar+gzip \
+              dist/metadata.json:application/json
+          fi
+          
+          echo "✅ Artifacts pushed successfully!"
+
+      - name: Create Release Notes
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          cat > dist/PULL_INSTRUCTIONS.md << 'EOF'
+          # Pull and Run Instructions
+          
+          ## Method 1: Pull and Run Bundle
+          
+          ```bash
+          # Pull the complete bundle
+          oras pull ${{ steps.meta.outputs.image_ref }}:${{ steps.meta.outputs.version }}
+          
+          # Extract bundle
+          tar xzf mcp-server-bundle.tar.gz
+          
+          # Run directly (auto-installs uv if needed)
+          ./run-mcp-server.sh
+          
+          # Or install globally
+          ./install-mcp-server.sh
+          ```
+          
+          ## Method 2: Pull Wheel Only
+          
+          ```bash
+          # Pull just the wheel
+          oras pull ${{ steps.meta.outputs.image_ref }}:wheel-${{ steps.meta.outputs.version }}
+          
+          # Run with uv
+          uv run --from *.whl ${{ steps.build.outputs.package_name }}
+          
+          # Or install as tool
+          uv tool install --from *.whl ${{ steps.build.outputs.package_name }}
+          ```
+          
+          ## Method 3: Python Direct Run
+          
+          ```bash
+          # After pulling bundle
+          python3 mcp-server.py
+          ```
+          EOF
+          
+          echo "📦 Pull instructions saved to dist/PULL_INSTRUCTIONS.md"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-server-artifacts
+          path: |
+            dist/*.whl
+            dist/*.sh
+            dist/*.py
+            dist/*.json
+            dist/*.tar.gz
+            dist/*.md
