@@ -1,0 +1,320 @@
+# Generic GitHub Actions Workflow Template for Building MCP Servers as OCI Artifacts
+# 
+# To use this template for your MCP server:
+# 1. Copy this file to .github/workflows/build-oci.yml
+# 2. No changes needed - it auto-detects everything!
+# 3. Push a tag (e.g., v1.0.0) to trigger the build
+#
+# The workflow automatically:
+# - Detects your package name from pyproject.toml
+# - Finds the entry point from [project.scripts]
+# - Builds wheel with uv
+# - Creates portable runners that work anywhere
+# - Pushes to your GitHub Container Registry
+
+name: Build and Push MCP Server as OCI Artifact
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: 'Container registry URL'
+        required: false
+        default: 'ghcr.io'
+
+env:
+  REGISTRY: ${{ github.event.inputs.registry || 'ghcr.io' }}
+  REPOSITORY: ${{ github.repository }}
+  PYTHON_VERSION: '3.12'  # Change this if you need a different Python version
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          version: "latest"
+
+      - name: Build wheel with uv
+        id: build
+        run: |
+          # Build the wheel
+          uv build --wheel --out-dir dist/
+          
+          # Get wheel filename and extract metadata
+          WHEEL_FILE=$(ls dist/*.whl | head -1)
+          WHEEL_NAME=$(basename "$WHEEL_FILE")
+          echo "wheel_file=$WHEEL_FILE" >> $GITHUB_OUTPUT
+          echo "wheel_name=$WHEEL_NAME" >> $GITHUB_OUTPUT
+          
+          # Extract package name and version from wheel filename
+          # Format: package_name-version-py3-none-any.whl
+          PACKAGE_NAME=$(echo "$WHEEL_NAME" | cut -d'-' -f1)
+          PACKAGE_VERSION=$(echo "$WHEEL_NAME" | cut -d'-' -f2)
+          
+          # Convert underscores to hyphens for the command name
+          COMMAND_NAME=$(echo "$PACKAGE_NAME" | tr '_' '-')
+          
+          echo "package_name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+          echo "package_version=$PACKAGE_VERSION" >> $GITHUB_OUTPUT
+          echo "command_name=$COMMAND_NAME" >> $GITHUB_OUTPUT
+
+      - name: Detect entry point
+        id: entry_point
+        run: |
+          # Auto-detect entry point from pyproject.toml or use package name
+          if [ -f pyproject.toml ]; then
+            ENTRY_POINT=$(python3 -c "
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+    
+with open('pyproject.toml', 'rb') as f:
+    data = tomllib.load(f)
+    scripts = data.get('project', {}).get('scripts', {})
+    if scripts:
+        # Get first script name (the command users will run)
+        print(list(scripts.keys())[0])
+    else:
+        # Fallback to package name with hyphens
+        print('${{ steps.build.outputs.command_name }}')
+" 2>/dev/null || echo "${{ steps.build.outputs.command_name }}")
+          else
+            ENTRY_POINT="${{ steps.build.outputs.command_name }}"
+          fi
+          
+          echo "Detected entry point: $ENTRY_POINT"
+          echo "entry_point=$ENTRY_POINT" >> $GITHUB_OUTPUT
+
+      - name: Create universal runner script
+        run: |
+          ENTRY_POINT="${{ steps.entry_point.outputs.entry_point }}"
+          
+          cat > dist/run-mcp-server.sh << 'EOF'
+          #!/usr/bin/env bash
+          # Universal MCP Server Runner
+          set -e
+          
+          SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+          
+          # Auto-install uv if needed
+          if ! command -v uv &> /dev/null; then
+              echo "Installing uv..."
+              curl -LsSf https://astral.sh/uv/install.sh | sh
+              export PATH="$HOME/.local/bin:$PATH"
+          fi
+          
+          # Find the wheel
+          WHEEL_FILE=$(ls "$SCRIPT_DIR"/*.whl 2>/dev/null | head -1)
+          if [ -z "$WHEEL_FILE" ]; then
+              echo "Error: No wheel file found in $SCRIPT_DIR"
+              exit 1
+          fi
+          
+          echo "Starting MCP server..."
+          exec uv run --from "$WHEEL_FILE" --with "$WHEEL_FILE" ENTRY_POINT_PLACEHOLDER "$@"
+          EOF
+          
+          # Replace placeholder with actual entry point
+          sed -i "s/ENTRY_POINT_PLACEHOLDER/$ENTRY_POINT/g" dist/run-mcp-server.sh
+          chmod +x dist/run-mcp-server.sh
+
+      - name: Create universal installer script
+        run: |
+          PACKAGE_NAME="${{ steps.build.outputs.package_name }}"
+          ENTRY_POINT="${{ steps.entry_point.outputs.entry_point }}"
+          
+          cat > dist/install-mcp-server.sh << 'EOF'
+          #!/usr/bin/env bash
+          # Universal MCP Server Installer
+          set -e
+          
+          SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+          
+          # Auto-install uv if needed
+          if ! command -v uv &> /dev/null; then
+              echo "Installing uv..."
+              curl -LsSf https://astral.sh/uv/install.sh | sh
+              export PATH="$HOME/.local/bin:$PATH"
+          fi
+          
+          # Find and install the wheel
+          WHEEL_FILE=$(ls "$SCRIPT_DIR"/*.whl 2>/dev/null | head -1)
+          if [ -z "$WHEEL_FILE" ]; then
+              echo "Error: No wheel file found"
+              exit 1
+          fi
+          
+          echo "Installing MCP server..."
+          uv tool install --from "$WHEEL_FILE" PACKAGE_NAME_PLACEHOLDER
+          
+          echo "✅ Installation complete!"
+          echo "Run with: ENTRY_POINT_PLACEHOLDER"
+          EOF
+          
+          # Replace placeholders
+          sed -i "s/PACKAGE_NAME_PLACEHOLDER/$PACKAGE_NAME/g" dist/install-mcp-server.sh
+          sed -i "s/ENTRY_POINT_PLACEHOLDER/$ENTRY_POINT/g" dist/install-mcp-server.sh
+          chmod +x dist/install-mcp-server.sh
+
+      - name: Create Python fallback runner
+        run: |
+          # This Python script works even without uv
+          cp /dev/stdin dist/mcp-server.py << 'EOF'
+          #!/usr/bin/env python3
+          """Universal Python runner for MCP servers - works with any MCP server wheel."""
+          import sys
+          import tempfile
+          import zipfile
+          import json
+          from pathlib import Path
+          
+          def find_wheel():
+              wheels = list(Path(__file__).parent.glob("*.whl"))
+              if not wheels:
+                  sys.exit("Error: No wheel file found")
+              return wheels[0]
+          
+          def get_entry_point(wheel_path):
+              """Extract entry point from wheel metadata."""
+              with zipfile.ZipFile(wheel_path, 'r') as z:
+                  # Check entry_points.txt
+                  for name in z.namelist():
+                      if name.endswith('.dist-info/entry_points.txt'):
+                          content = z.read(name).decode('utf-8')
+                          if '[console_scripts]' in content:
+                              for line in content.split('[console_scripts]')[1].split('\n'):
+                                  if '=' in line and not line.startswith('['):
+                                      return line.split('=', 1)[1].strip()
+              return None
+          
+          def run_mcp_server(wheel_path):
+              """Extract and run the MCP server."""
+              with tempfile.TemporaryDirectory() as tmpdir:
+                  with zipfile.ZipFile(wheel_path, 'r') as z:
+                      z.extractall(tmpdir)
+                  
+                  sys.path.insert(0, tmpdir)
+                  
+                  # Get entry point
+                  entry = get_entry_point(wheel_path)
+                  if entry and ':' in entry:
+                      module_name, func_name = entry.split(':', 1)
+                      module = __import__(module_name, fromlist=[func_name])
+                      getattr(module, func_name)()
+                  else:
+                      # Try common patterns
+                      pkg = wheel_path.stem.split('-')[0]
+                      for attempt in [f"{pkg}.server:main", f"{pkg}:main", "server:main"]:
+                          try:
+                              mod, func = attempt.split(':')
+                              __import__(mod, fromlist=[func])
+                              getattr(__import__(mod, fromlist=[func]), func)()
+                              return
+                          except:
+                              continue
+                      sys.exit("Could not find entry point")
+          
+          if __name__ == "__main__":
+              wheel = find_wheel()
+              print(f"Starting MCP server from {wheel.name}...")
+              run_mcp_server(wheel)
+          EOF
+          
+          chmod +x dist/mcp-server.py
+
+      - name: Create metadata
+        run: |
+          cat > dist/metadata.json << EOF
+          {
+            "name": "${{ steps.build.outputs.package_name }}",
+            "version": "${{ steps.build.outputs.package_version }}",
+            "command": "${{ steps.entry_point.outputs.entry_point }}",
+            "wheel": "${{ steps.build.outputs.wheel_name }}",
+            "python_version": "${{ env.PYTHON_VERSION }}",
+            "build_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "git_sha": "${{ github.sha }}",
+            "git_ref": "${{ github.ref }}"
+          }
+          EOF
+
+      - name: Create bundle
+        run: |
+          cd dist
+          tar czf mcp-server-bundle.tar.gz *.whl *.sh *.py metadata.json
+          echo "Bundle created: $(ls -lh mcp-server-bundle.tar.gz)"
+
+      - name: Install ORAS
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          VERSION="1.2.0"
+          curl -sLO "https://github.com/oras-project/oras/releases/download/v${VERSION}/oras_${VERSION}_linux_amd64.tar.gz"
+          tar -xzf oras_${VERSION}_*.tar.gz
+          sudo mv oras /usr/local/bin/
+          oras version
+
+      - name: Log in to registry
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push OCI artifacts
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          # Determine version tag
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION="git-${GITHUB_SHA::8}"
+          fi
+          
+          IMAGE_REF="${{ env.REGISTRY }}/${{ env.REPOSITORY }}"
+          
+          # Push bundle
+          echo "Pushing to $IMAGE_REF:$VERSION"
+          oras push "$IMAGE_REF:$VERSION" \
+            --artifact-type "application/vnd.mcp.server.v1+tar" \
+            --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            dist/mcp-server-bundle.tar.gz:application/tar+gzip \
+            dist/metadata.json:application/json
+          
+          # Also push as latest for main branch
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            oras push "$IMAGE_REF:latest" \
+              --artifact-type "application/vnd.mcp.server.v1+tar" \
+              dist/mcp-server-bundle.tar.gz:application/tar+gzip \
+              dist/metadata.json:application/json
+          fi
+          
+          echo "✅ Published to OCI registry!"
+          echo "Users can pull with:"
+          echo "  oras pull $IMAGE_REF:$VERSION"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-server-dist
+          path: dist/
