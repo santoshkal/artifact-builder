@@ -60,12 +60,26 @@ jobs:
           # Create metadata
           echo "{\"package\": \"$PACKAGE_NAME\", \"wheel\": \"$(basename $WHEEL)\"}" > dist/metadata.json
 
+      - name: Push OCI artifact
+        id: push
+        run: |
           # Push OCI artifact using genval (expects directory, not tar)
           TAG="${GITHUB_REF_NAME:-latest}"
-          
-          # genval expects a directory as input
+          IMAGE_URI="${{ env.REGISTRY }}/${{ env.REPOSITORY }}:$TAG"
+
+          # genval expects oci:// prefix for push
           genval artifact push --reqinput dist \
-          --dest "${{ env.REGISTRY }}/${{ env.REPOSITORY }}:$TAG" \
+          --dest "oci://$IMAGE_URI" \
           --annotations="author=capten.ai"
 
-          echo "✅ Pushed to: ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:$TAG"
+          echo "✅ Pushed to: $IMAGE_URI"
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Artifact with Cosign
+        run: |
+          echo "Signing artifact ${{ steps.push.outputs.IMAGE_URI }}"
+          # cosign doesn't need oci:// prefix
+          cosign sign --yes ${{ steps.push.outputs.IMAGE_URI }}
