@@ -19,6 +19,7 @@ jobs:
     permissions:
       packages: write
       contents: read
+      id-token: write  # Required for OIDC authentication with cosign
 
     steps:
       - uses: actions/checkout@v4
