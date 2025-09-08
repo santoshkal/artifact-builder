@@ -72,6 +72,6 @@ jobs:
           TAG="${GITHUB_REF_NAME:-latest}"
           genval artifact push --reqinput bundle.tar.gz \
           --dest "${{ env.REGISTRY }}/${{ env.REPOSITORY }}:$TAG" \
-          --annotation="author=capten.ai"
+          --annotations="author=capten.ai"
 
           echo "✅ Pushed to: ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:$TAG"
