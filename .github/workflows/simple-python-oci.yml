@@ -60,17 +60,11 @@ jobs:
           # Create metadata
           echo "{\"package\": \"$PACKAGE_NAME\", \"wheel\": \"$(basename $WHEEL)\"}" > dist/metadata.json
 
-          # # Login to registry
-          # echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u ${{ github.actor }} --password-stdin
-
-          # Create and push bundle
-          cd dist
-          tar czf bundle.tar.gz *.whl run.sh metadata.json
-
-
-          # Push OCI artifact
+          # Push OCI artifact using genval (expects directory, not tar)
           TAG="${GITHUB_REF_NAME:-latest}"
-          genval artifact push --reqinput bundle.tar.gz \
+          
+          # genval expects a directory as input
+          genval artifact push --reqinput dist \
           --dest "${{ env.REGISTRY }}/${{ env.REPOSITORY }}:$TAG" \
           --annotations="author=capten.ai"
 
