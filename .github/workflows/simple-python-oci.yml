@@ -60,8 +60,8 @@ jobs:
           # Create metadata
           echo "{\"package\": \"$PACKAGE_NAME\", \"wheel\": \"$(basename $WHEEL)\"}" > dist/metadata.json
 
-          # Login to registry
-          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u ${{ github.actor }} --password-stdin
+          # # Login to registry
+          # echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u ${{ github.actor }} --password-stdin
 
           # Create and push bundle
           cd dist
@@ -75,5 +75,3 @@ jobs:
           --annotation="author=capten.ai"
 
           echo "✅ Pushed to: ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:$TAG"
-          echo "Pull with: oras pull ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:$TAG"
-
